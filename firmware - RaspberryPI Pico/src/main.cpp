@@ -33,8 +33,11 @@ char Mobile_Num[] = "+91XXXXXXXXXX"; // Receiving Mobile no.
 #define Out1 6 // Relay 1
 #define Out2 7 // Relay 2
 
-// Flag pin to check if INternet is Up!
+// Flag pin to check if Blynk Connection successful by esp8266!
 #define ESP_BOOT_FLAG 10
+
+// PICO Boot state feedback to ESP8266
+#define PICO_BOOT_FLAG 15
 
 //  Display Timeout helpers
 #define DISPLAY_UPDATE_MS 1000 // Display Value update timing (default 1s)
@@ -47,12 +50,12 @@ static unsigned long ledTimer = 0;
 static bool ledOn = false;
 
 // Boot flags
-static unsigned int Boot_Ittr_Count = 0;
-static bool ready = false;
-static bool initPromptShowed = false;
+int Boot_Ittr_Count = 0;
+bool ready = false;
+bool initPromptShowed = false;
 // Display
-static unsigned long lastDisplayUpdate = 0;
-static unsigned long lastDisplayStateUpdate = 0;
+long long lastDisplayUpdate = 0;
+long long lastDisplayStateUpdate = 0;
 int displayStateOption = 0;
 
 // Buffers and Helpers
@@ -60,7 +63,24 @@ char rxBuff[32];
 char buff[32];
 char totalBill[32];
 unsigned int idx = 0;
-unsigned long lastSend = 0;
+unsigned long long lastSend = 0;
+
+char sms[256]; // SMS buffer
+
+bool interruptReady = false;
+
+struct switches
+{
+public:
+  bool s1 = false;
+  bool s2 = false;
+
+  void writeSwitch()
+  {
+    digitalWrite(Out1, !s1);
+    digitalWrite(Out2, !s2);
+  }
+};
 
 struct Sim
 {
@@ -329,6 +349,8 @@ void setup()
   pinMode(CAL_IN, INPUT_PULLUP);
   // ESP_UART_Flag Input pin
   pinMode(ESP_BOOT_FLAG, INPUT);
+  // PICO feedback output
+  pinMode(PICO_BOOT_FLAG, OUTPUT);
 
   // OUTPUTS PINS
   pinMode(CAL_STATE_LED, OUTPUT);
@@ -341,6 +363,7 @@ void setup()
   digitalWrite(Out2, 1);
   digitalWrite(CAL_STATE_LED, 0);
 
+  digitalWrite(PICO_BOOT_FLAG, 1);
   // I2C Display init
   Wire.begin(); // I2C GPIO - 4, 5
 
@@ -351,6 +374,9 @@ void setup()
     while (1)
       ;
   }
+  lcd.setCursor(0, 0);
+  lcd.clear();
+
   //  SIM800L UART
   sim800.setRX(RXPin_2);
   sim800.setTX(TXPin_2);
@@ -359,11 +385,9 @@ void setup()
   sim.stateTimer = millis();
 
   digitalWrite(CAL_STATE_LED, 0); // toggle back led to LOW for normal use
-  lcd.clear();
-  lcd.setCursor(0, 0);
   lcd.print("BOOTING SYSTEM..");
 }
-
+switches s;
 void loop()
 {
   sim.readSerial();
@@ -371,16 +395,19 @@ void loop()
   {
     if (!initPromptShowed)
     {
-      while (esp.available())
+      while (esp.available() > 0)
         esp.read(); // clear garbage from buff
       lcd.setCursor(0, 0);
       lcd.print("BOOT SUCCESS !!!");
+      digitalWrite(CAL_STATE_LED, 0); // toggle back led to LOW for normal use
+      digitalWrite(PICO_BOOT_FLAG, 1);
+      initPromptShowed = true;
+    }
+
+    if (interruptReady)
+    {
       // Interrupt setup
       attachInterrupt(digitalPinToInterrupt(CAL_IN), onPulse, FALLING);
-      digitalWrite(CAL_STATE_LED, 0); // toggle back led to LOW for normal use
-      delay(50);
-      lcd.clear();
-      initPromptShowed = true;
     }
 
     if (digitalRead(ESP_BOOT_FLAG) == 1)
@@ -392,6 +419,11 @@ void loop()
           esp.read(); // clear garbage from buff
         delay(20);
       }
+
+      // drive active-low relays
+      if (Boot_Ittr_Count > 0 && interruptReady)
+        s.writeSwitch();
+
       // ---- Meter pulse LED Trigger ----
       if (meter.pulseFlag)
       {
@@ -407,11 +439,11 @@ void loop()
       }
 
       // SIM800L Send SMS
-      char sms[256];
       snprintf(sms, sizeof(sms),
                "Meter Reading: %s kWh, Bill: Rs %s. Pay soon.",
                strlen(buff) > 0 ? buff : "0.0", strlen(totalBill) > 0 ? totalBill : "0.0");
       sim.sendSMS(Mobile_Num, sms);
+      memset(sms, sizeof(sms), 0);
 
       // ---- Display ----
       if (millis() - lastDisplayStateUpdate > DSIPLAY_SHFT_MS)
@@ -426,7 +458,7 @@ void loop()
         DsiplayOut(buff, totalBill, displayStateOption);
       }
 
-      // ---- Send units to ESP every 1 second ----
+      // ---- Send units to ESP every 1 second if changed----
       if (millis() - lastSend > 1000)
       {
         lastSend = millis();
@@ -446,7 +478,7 @@ void loop()
       }
 
       // ---- UART receive ----
-      while (esp.available())
+      while (esp.available() > 0)
       {
         char c = esp.read();
         if (c == '\r')
@@ -456,22 +488,23 @@ void loop()
           if (idx == 0)
             continue;
           rxBuff[idx] = '\0'; // complete message
+
           // ---- Process message ----
           if (strlen(rxBuff) == 1 && isdigit(rxBuff[0]))
           {
             switch (rxBuff[0])
             {
             case '1':
-              digitalWrite(Out1, 0);
+              s.s1 = true;
               break;
             case '2':
-              digitalWrite(Out1, 1);
+              s.s1 = false;
               break;
             case '3':
-              digitalWrite(Out2, 0);
+              s.s2 = true;
               break;
             case '4':
-              digitalWrite(Out2, 1);
+              s.s2 = false;
               break;
             }
           }
@@ -482,6 +515,7 @@ void loop()
             buff[sizeof(buff) - 1] = '\0';
             meter.pulseCount = meter.kWhString_ToPulses(rxBuff);
             Boot_Ittr_Count = 1;
+            interruptReady = true;
           }
           idx = 0;
           continue;
@@ -497,22 +531,37 @@ void loop()
       }
     }
     else
-    { // keep All Switches OFF until ESP UART Starts
-      digitalWrite(Out1, 1);
-      digitalWrite(Out2, 1);
+    {
+      digitalWrite(PICO_BOOT_FLAG, 0);
+      ready = false; // keep All Switches OFF until ESP UART Starts
+      lastDisplayUpdate = 0;
+      if (millis() - lastDisplayUpdate > 1000)
+      {
+        lastDisplayUpdate = millis();
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Reconnecting...");
+      }
     }
   }
   else
   {
+    detachInterrupt(digitalPinToInterrupt(CAL_IN));
     digitalWrite(Out1, 1);
     digitalWrite(Out2, 1);
     digitalWrite(CAL_STATE_LED, 1);
     Boot_Ittr_Count = 0;
     idx = 0;
-    ready = false;
+    initPromptShowed = false;
+    interruptReady = false;
+    memset(buff, sizeof(buff), 0);
+    memset(rxBuff, sizeof(rxBuff), 0);
+    memset(sms, sizeof(sms), 0);
+    memset(totalBill, sizeof(totalBill), 0);
     if (digitalRead(ESP_BOOT_FLAG))
     {
       ready = true;
+      lastDisplayUpdate = 0;
     }
   }
 }
